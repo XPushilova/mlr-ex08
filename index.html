@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Leaf classifier</title>
+  <style>
+    :root {
+      font-family: Inter, system-ui, sans-serif;
+      color: #192b24;
+      background: #f1f5ee;
+      accent-color: #285d45;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; }
+    main { width: min(100% - 32px, 880px); margin: 0 auto; padding: 40px 0; }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 6vw, 3.15rem); letter-spacing: -.05em; }
+    h2 { margin: 0 0 20px; font-size: 1.05rem; }
+    header p { margin: 0; color: #496056; }
+    .panels {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+      gap: 24px;
+      margin-top: 24px;
+    }
+    .panel {
+      padding: 20px;
+      border: 1px solid #d7e1d5;
+      border-radius: 20px;
+      background: #fff;
+    }
+    .preview {
+      display: grid;
+      place-items: center;
+      aspect-ratio: 1;
+      overflow: hidden;
+      border-radius: 12px;
+      background: #e6eee4;
+      color: #375247;
+      text-align: center;
+    }
+    .preview p { padding: 16px; margin: 0; }
+    video, .preview img { width: 100%; height: 100%; object-fit: cover; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    button {
+      min-height: 44px;
+      padding: 9px 16px;
+      border: 1px solid #b7cabc;
+      border-radius: 9px;
+      background: #fff;
+      color: #28513e;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    button.primary { border-color: #234c38; background: #234c38; color: #fff; }
+    button:disabled { opacity: .55; cursor: default; }
+    :focus-visible { outline: 3px solid #367b58; outline-offset: 3px; }
+    #status { margin: 12px 0 0; min-height: 1.5em; color: #496056; font-size: .9rem; }
+    #status[data-error] { color: #a32e25; }
+    #probabilities { list-style: none; margin: 0; padding: 0; }
+    #probabilities li { margin-bottom: 16px; }
+    .score { display: flex; justify-content: space-between; gap: 12px; }
+    .score span:first-child { text-transform: capitalize; }
+    output { font-variant-numeric: tabular-nums; }
+    meter { display: block; width: 100%; height: 14px; margin-top: 4px; }
+    a { color: #234c38; overflow-wrap: anywhere; }
+    footer { display: flex; align-items: center; gap: 16px; margin-top: 24px; }
+    footer img { flex: 0 0 auto; width: 128px; height: 128px; }
+    @media (max-width: 640px) {
+      main { padding: 24px 0; }
+      .panels { grid-template-columns: 1fr; gap: 14px; }
+      .panel { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Leaf classifier</h1>
+      <p>Point your camera at a leaf or choose a photo.</p>
+    </header>
+
+    <div class="panels">
+      <section class="panel" aria-label="Leaf image">
+        <div class="preview">
+          <p id="preview-hint">Center a single leaf in the square.</p>
+          <video id="video" autoplay muted playsinline hidden></video>
+          <img id="photo" alt="Selected photo" hidden>
+        </div>
+        <div class="controls">
+          <button type="button" id="camera" class="primary" disabled>Start camera</button>
+          <button type="button" id="upload" disabled>Choose photo</button>
+          <input type="file" id="file" accept="image/*" hidden>
+        </div>
+        <p id="status" role="status">Loading the model…</p>
+      </section>
+
+      <section class="panel" aria-labelledby="probability-heading">
+        <h2 id="probability-heading">Class probabilities</h2>
+        <ul id="probabilities"></ul>
+      </section>
+    </div>
+
+    <footer class="panel">
+      <img src="./qr.png" width="128" height="128" alt="QR code for the live leaf classifier">
+      <div>
+        <h2>Open on your phone</h2>
+        <a href="https://xpushilova.github.io/mlr-ex08/">https://xpushilova.github.io/mlr-ex08/</a>
+      </div>
+    </footer>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+  <script>
+    const video = document.querySelector("#video");
+    const photo = document.querySelector("#photo");
+    const hint = document.querySelector("#preview-hint");
+    const camera = document.querySelector("#camera");
+    const upload = document.querySelector("#upload");
+    const file = document.querySelector("#file");
+    const status = document.querySelector("#status");
+    const probabilities = document.querySelector("#probabilities");
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+
+    let metadata;
+    let session;
+    let scores;
+    let stream;
+    let timer;
+    let photoUrl;
+    let pendingPrediction = Promise.resolve();
+
+    function setStatus(message, error = false) {
+      status.textContent = message;
+      status.toggleAttribute("data-error", error);
+    }
+
+    function show(source) {
+      video.hidden = source !== video;
+      photo.hidden = source !== photo;
+      hint.hidden = Boolean(source);
+    }
+
+    function stopCamera() {
+      clearTimeout(timer);
+      stream?.getTracks().forEach(track => track.stop());
+      stream = undefined;
+      video.srcObject = null;
+      camera.textContent = "Start camera";
+    }
+
+    function render(values) {
+      scores.forEach(({ number, meter }, index) => {
+        number.value = values[index]?.toFixed(3) ?? "—";
+        meter.value = values[index] ?? 0;
+      });
+    }
+
+    async function predict(source, width, height) {
+      const { input_size: size, mean, std } = metadata;
+      const side = Math.min(width, height);
+      context.clearRect(0, 0, size, size);
+      context.drawImage(source, (width - side) / 2, (height - side) / 2,
+        side, side, 0, 0, size, size);
+      const { data } = context.getImageData(0, 0, size, size);
+      const area = size * size;
+      const rgb = new Float32Array(3 * area);
+      for (let channel = 0; channel < 3; channel++) {
+        for (let i = 0; i < area; i++) {
+          rgb[channel * area + i] = (data[4 * i + channel] / 255 - mean[channel]) / std[channel];
+        }
+      }
+      const tensor = new ort.Tensor("float32", rgb, [1, 3, size, size]);
+      const { logits } = await session.run({ image: tensor });
+      const maximum = Math.max(...logits.data);
+      const exps = Array.from(logits.data, value => Math.exp(value - maximum));
+      const total = exps.reduce((sum, value) => sum + value, 0);
+      return exps.map(value => value / total);
+    }
+
+    async function classifyFrame(activeStream) {
+      if (stream !== activeStream) return;
+      try {
+        if (video.readyState >= 2) {
+          pendingPrediction = predict(video, video.videoWidth, video.videoHeight);
+          const values = await pendingPrediction;
+          if (stream === activeStream) render(values);
+        }
+      } catch {
+        if (stream === activeStream) {
+          stopCamera();
+          show();
+          render([]);
+          setStatus("Camera classification failed. Try choosing a photo.", true);
+        }
+      }
+      if (stream === activeStream) timer = setTimeout(() => classifyFrame(activeStream), 125);
+    }
+
+    camera.addEventListener("click", async () => {
+      if (stream) {
+        stopCamera();
+        show();
+        render([]);
+        setStatus("Camera stopped.");
+        return;
+      }
+
+      camera.disabled = upload.disabled = true;
+      setStatus("Starting the camera…");
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("The camera needs a secure page. Choose a photo instead.");
+        }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 640 } }
+        });
+        video.srcObject = stream;
+        show(video);
+        await video.play();
+        await pendingPrediction.catch(() => {});
+        camera.textContent = "Stop camera";
+        render([]);
+        setStatus("Camera is on.");
+        classifyFrame(stream);
+      } catch (error) {
+        stopCamera();
+        show();
+        render([]);
+        setStatus(error.message || "Camera unavailable. Choose a photo instead.", true);
+      } finally {
+        camera.disabled = upload.disabled = false;
+      }
+    });
+
+    upload.addEventListener("click", () => file.click());
+    file.addEventListener("change", async () => {
+      const selected = file.files[0];
+      file.value = "";
+      if (!selected) return;
+
+      stopCamera();
+      camera.disabled = upload.disabled = true;
+      show();
+      render([]);
+      setStatus("Reading the photo…");
+      if (photoUrl) URL.revokeObjectURL(photoUrl);
+      photoUrl = URL.createObjectURL(selected);
+      try {
+        const loaded = new Promise((resolve, reject) => {
+          photo.onload = resolve;
+          photo.onerror = reject;
+        });
+        photo.src = photoUrl;
+        await loaded;
+        await pendingPrediction.catch(() => {});
+        show(photo);
+        render(await predict(photo, photo.naturalWidth, photo.naturalHeight));
+        setStatus("Photo classified.");
+      } catch {
+        show();
+        setStatus("This photo could not be classified. Try another image.", true);
+      } finally {
+        camera.disabled = upload.disabled = false;
+      }
+    });
+
+    window.addEventListener("pagehide", stopCamera);
+
+    async function initialize() {
+      try {
+        if (!globalThis.ort) throw new Error("ONNX Runtime could not load.");
+        const response = await fetch("./model_info.json");
+        if (!response.ok) throw new Error("Model metadata could not load.");
+        metadata = await response.json();
+        canvas.width = canvas.height = metadata.input_size;
+        scores = metadata.classes.map(name => {
+          const row = document.createElement("li");
+          const score = document.createElement("div");
+          score.className = "score";
+          const label = document.createElement("span");
+          label.textContent = name;
+          const number = document.createElement("output");
+          number.value = "—";
+          const meter = document.createElement("meter");
+          meter.max = 1;
+          meter.setAttribute("aria-label", `${name} probability`);
+          score.append(label, number);
+          row.append(score, meter);
+          probabilities.append(row);
+          return { number, meter };
+        });
+
+        ort.env.wasm.numThreads = 1;
+        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+        session = await ort.InferenceSession.create("./leaf_model.onnx", { executionProviders: ["wasm"] });
+        camera.disabled = upload.disabled = false;
+        setStatus("Ready. Images stay on this device.");
+      } catch (error) {
+        setStatus(`Model could not load. ${error.message}`, true);
+      }
+    }
+
+    initialize();
+  </script>
+</body>
+</html>
